@@ -1,21 +1,18 @@
 package cache
 
 /*
-	Tree-based, thread-safe cache implementation using sync.Map
+	Tree-based, thread-safe, in-memory cache implementation utilizing sync.Map
 
-	Outer cache use sync.Map
-
-	Tried out multiple combinations and fastest impl for avg read/write time
-	seems to be sync.Map for outer cache with map[string]Cache item values
-	and manual RWMutex management
-
-	May also be worth adding to cache struct to make it truly recursive
-	rather than using cacheItem
+	To increase read/write perf, inner cache items are a map[string]*cacheItem
+	that use a *sync.RWMutext for locking
 */
 
 import (
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/brycejech/go-cache/util"
 )
 
 func NewCache() Cache {
@@ -39,7 +36,7 @@ func (c *cache) Get(path []string) Cache {
 		return nil
 	}
 
-	item, ok := mapItem.(*cacheItem)
+	item, ok := mapItem.(Cache)
 	if !ok {
 		return nil
 	}
@@ -51,9 +48,9 @@ func (c *cache) Get(path []string) Cache {
 	return item.Get(path[1:])
 }
 
-func (c *cache) Set(path []string, ttl int, data []byte) bool {
+func (c *cache) Set(path []string, ttl int, data []byte) error {
 	if len(path) == 0 {
-		return false
+		return errors.New(ERR_SET_EMPTY_PATH)
 	}
 
 	key := path[0]
@@ -67,26 +64,21 @@ func (c *cache) Set(path []string, ttl int, data []byte) bool {
 	existing, ok := c.items.Load(key)
 	if !ok {
 		if len(path) == 1 {
-			mapCache := NewMapCache()
+			mapCache := newCacheItem()
 			mapCache.Set([]string{}, ttl, data)
 			c.items.Store(key, mapCache)
 
-			// c.items.Store(key, newCacheItem([]string{}, ttl, data))
-
-			return true
+			return nil
 		}
 
-		mapCache := NewMapCache()
+		mapCache := newCacheItem()
 		mapCache.Set(path[1:], ttl, data)
 		c.items.Store(key, mapCache)
-
-		// c.items.Store(key, newCacheItem(path[1:], ttl, data))
-		return true
 	}
 
-	item, ok := existing.(*cacheItem)
+	item, ok := existing.(Cache)
 	if !ok {
-		return false
+		return errors.New("assertion error: cacheItem is not Cache")
 	}
 
 	if len(path) == 1 {
@@ -96,19 +88,19 @@ func (c *cache) Set(path []string, ttl int, data []byte) bool {
 	return item.Set(path[1:], ttl, data)
 }
 
-func (c *cache) Delete(path []string) bool {
+func (c *cache) Delete(path []string) error {
 	if len(path) == 0 {
-		return true
+		return errors.New(ERR_DELETE_EMPTY_PATH)
 	}
 
 	if len(path) == 1 {
 		c.items.Delete(path[0])
-		return true
+		return nil
 	}
 
 	item := c.Get(path)
 	if item == nil {
-		return true
+		return nil
 	}
 
 	return item.Delete(path[1:])
@@ -118,107 +110,41 @@ func (c *cache) Read() []byte {
 	return []byte{}
 }
 
-func newCacheItem(path []string, ttl int, data []byte) Cache {
-	item := &cacheItem{
-		items: &sync.Map{},
-	}
+func (c *cache) Size() int {
+	size := 0
 
-	if len(path) == 0 {
-		item.ttl = ttl
-		item.data = data
+	c.items.Range(func(_ any, val any) bool {
+		cache, ok := val.(Cache)
+		if !ok || cache == nil {
+			return true
+		}
 
-		return item
-	}
+		size += cache.Size()
+		return true
+	})
 
-	item.Set(path, ttl, data)
-
-	return item
+	return size
 }
 
-type cacheItem struct {
-	mu    sync.RWMutex
-	ttl   int
-	data  []byte
-	items *sync.Map
-}
-
-func (c *cacheItem) Get(path []string) Cache {
-	if len(path) < 1 {
-		return nil
+func (c *cache) Visualize() map[string]any {
+	items := map[string]any{}
+	tree := map[string]any{
+		"size":  util.ByteSizeToStr(int64(c.Size())),
+		"items": items,
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	key := path[0]
-	mapItem, ok := c.items.Load(key)
-	if !ok {
-		return nil
-	}
-
-	item, ok := mapItem.(*cacheItem)
-	if !ok {
-		return nil
-	}
-
-	if len(path) == 1 {
-		return item
-	}
-
-	return item.Get(path[1:])
-}
-
-func (c *cacheItem) Set(path []string, ttl int, data []byte) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if len(path) == 0 {
-		c.ttl = ttl
-		c.data = data
-		c.items = &sync.Map{}
-
+	c.items.Range(func(key any, val any) bool {
+		cache, ok := val.(Cache)
+		if !ok || cache == nil {
+			items[key.(string)] = map[string]any{
+				"size":  util.ByteSizeToStr(0),
+				"items": map[string]any{},
+			}
+			return true
+		}
+		items[key.(string)] = cache.Visualize()
 		return true
-	}
+	})
 
-	key := path[0]
-	if len(path) == 1 {
-		c.items.Store(key, newCacheItem([]string{}, ttl, data))
-
-		time.AfterFunc(time.Millisecond*time.Duration(ttl), func() {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-
-			c.items.Delete(key)
-		})
-
-		return true
-	}
-
-	c.items.Store(key, newCacheItem(path[1:], ttl, data))
-	return true
-}
-
-func (c *cacheItem) Delete(path []string) bool {
-	if len(path) == 0 {
-		return true
-	}
-
-	if len(path) == 1 {
-		c.items.Delete(path[0])
-		return true
-	}
-
-	item := c.Get(path)
-	if item == nil {
-		return true
-	}
-
-	return item.Delete(path[1:])
-}
-
-func (c *cacheItem) Read() []byte {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.data
+	return tree
 }
